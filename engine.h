@@ -8,18 +8,22 @@ namespace HiggsPluginAPI { struct IHiggsInterface001; extern IHiggsInterface001*
 
 namespace InteractiveWaterVR
 {
- // Trampoline provided by CommonLibSSE-NG; pointer placeholder set after creation
- extern SKSE::Trampoline* g_trampoline;
+	// Trampoline provided by CommonLibSSE-NG; pointer placeholder set after creation
+	extern SKSE::Trampoline* g_trampoline;
 
- // Entry point called once init is complete and dependent APIs are available.
- void StartMod();
+	// Reset all runtime state - MUST be called on every game load (kPreLoadGame, kNewGame)
+	// This clears cached pointers, static flags, and prepares for fresh initialization
+	void ResetAllRuntimeState();
 
- // Schedule StartMod to run after a delay (seconds). Safe to call multiple times; only one scheduled start will run.
- void ScheduleStartMod(int delaySeconds =2);
+	// Entry point called once init is complete and dependent APIs are available.
+	void StartMod();
 
- // Cancel any pending scheduled StartMod and reset internal start state.
- void CancelScheduledStartMod();
+	// Schedule StartMod to run after a delay (seconds). Safe to call multiple times; only one scheduled start will run.
+	void ScheduleStartMod(int delaySeconds = 2);
 
- // Log whether SpellInteractionsVR.esp is loaded when game data is ready
- void LogSpellInteractionsVRLoaded();
+	// Cancel any pending scheduled StartMod and reset internal start state.
+	void CancelScheduledStartMod();
+
+	// Log whether SpellInteractionsVR.esp is loaded when game data is ready
+	void LogSpellInteractionsVRLoaded();
 }

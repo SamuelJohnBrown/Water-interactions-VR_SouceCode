@@ -22,6 +22,9 @@ namespace InteractiveWaterVR
  // Query whether a game load is currently in progress
  bool IsGameLoadInProgress();
 
+ // Clear all cached form pointers and reset state - MUST be called on every game load
+ void ClearCachedForms();
+
  // Global flags indicating whether a submerged selected spell has the given magic-damage-type keyword.
  // These are `extern` so other translation units may observe them without pulling in the full implementation.
  extern std::atomic<bool> s_submergedMagicDamageFire;

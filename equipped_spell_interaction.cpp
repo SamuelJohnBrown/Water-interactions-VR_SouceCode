@@ -833,4 +833,39 @@ void StopSpellUnequipMonitor() {
  StopFrostChargeSound(false);
 }
 
+void ClearSpellInteractionCachedForms()
+{
+	IW_LOG_INFO("ClearSpellInteractionCachedForms: clearing all cached spell interaction forms");
+	
+	// Stop any running threads first
+	StopSpellUnequipMonitor();
+	StopFrostChargeStaticSpawner(true);
+	StopFrostChargeStaticSpawner(false);
+	StopFrostChargeSound(true);
+	StopFrostChargeSound(false);
+	
+	// Clear cached form pointers
+	s_shockSelfSpell = nullptr;
+	s_shockSelfFullId = 0;
+	s_shockSpellActive.store(false);
+	
+	s_frostSpawnForm = nullptr;
+	s_frostSpawnFullId = 0;
+	s_frostChargeSoundDesc = nullptr;
+	s_frostChargeStaticForm = nullptr;
+	s_frostChargeStaticFullId = 0;
+	
+	// Clear sound handles
+	s_leftFrostChargeHandle = RE::BSSoundHandle();
+	s_rightFrostChargeHandle = RE::BSSoundHandle();
+	s_leftFrostChargePlaying = false;
+	s_rightFrostChargePlaying = false;
+	
+	// Clear object refs
+	s_leftFrostChargeStaticRef.reset();
+	s_rightFrostChargeStaticRef.reset();
+	
+	IW_LOG_INFO("ClearSpellInteractionCachedForms: all spell interaction forms cleared");
+}
+
 } // namespace InteractiveWaterVR

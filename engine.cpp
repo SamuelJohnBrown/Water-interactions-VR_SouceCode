@@ -6,227 +6,327 @@
 #include <thread>
 #include <atomic>
 #include <string>
+#include <mutex>
 
 namespace InteractiveWaterVR
 {
- SKSE::Trampoline* g_trampoline = nullptr;
+	SKSE::Trampoline* g_trampoline = nullptr;
 
- static std::atomic<bool> s_startScheduled{ false };
- static std::thread s_startThread;
- // Indicates whether StartMod has already executed for the current runtime session
- static std::atomic<bool> s_modStarted{ false };
- // Generation token to invalidate previously scheduled start tasks
- static std::atomic<uint32_t> s_startGeneration{0};
- // Consecutive success tracking for readiness checks
- static std::atomic<uint32_t> s_checkSuccesses{0};
- static std::atomic<uint32_t> s_checkGen{0};
+	// Indicates whether StartMod has already executed successfully for the current game session
+	static std::atomic<bool> s_modStarted{ false };
+	// Generation token to invalidate previously scheduled start tasks
+	static std::atomic<uint32_t> s_startGeneration{0};
 
- void CancelScheduledStartMod()
- {
-	 // increment generation to invalidate pending tasks
-	 s_startGeneration.fetch_add(1, std::memory_order_acq_rel);
-	 s_startScheduled.store(false);
-	 // reset mod started flag so future loads can start fresh
-	 s_modStarted.store(false);
-	 try {
-		 if (s_startThread.joinable()) s_startThread.join();
-	 } catch (...) {
-		 IW_LOG_WARN("CancelScheduledStartMod: failed to join start thread");
-	 }
- }
+	// Ensure SpellInteractions logging runs only once per game session (reset on load)
+	static std::atomic<bool> s_spellLogged{false};
 
- // Ensure SpellInteractions logging runs only once per process
- static std::atomic<bool> s_spellLogged{false};
+	// Track reschedule count to prevent infinite loops
+	static std::atomic<int> s_rescheduleCount{0};
+	static constexpr int kMaxReschedules = 60; // Give up after 60 attempts (~60 seconds)
 
- void LogSpellInteractionsVRLoaded()
- {
-	 // Only run once
-	 bool expected = false;
-	 if (!s_spellLogged.compare_exchange_strong(expected, true)) {
-		 return;
-	 }
- 
- auto handler = RE::TESDataHandler::GetSingleton();
- if (!handler) {
- IW_LOG_WARN("LogSpellInteractionsVRLoaded: TESDataHandler not available");
- return;
- }
+	void ResetAllRuntimeState()
+	{
+		IW_LOG_INFO("ResetAllRuntimeState: clearing all session state for new game/load");
+		
+		// Increment generation to invalidate any pending scheduled tasks
+		s_startGeneration.fetch_add(1, std::memory_order_acq_rel);
+		
+		// Reset module started flag so StartMod can run again
+		s_modStarted.store(false);
+		
+		// Reset spell logging flag so it logs again for new session
+		s_spellLogged.store(false);
+		
+		// Reset reschedule counter
+		s_rescheduleCount.store(0);
+		
+		// Stop monitoring thread so it can be restarted fresh
+		StopWaterMonitoring();
+		
+		// CRITICAL: Clear all cached form pointers from previous session
+		// Forms from previous saves are invalid in the new session!
+		ClearCachedForms();
+		
+		// Notify that we're in a load state
+		NotifyGameLoadStart();
+	}
 
- const auto mod = handler->LookupLoadedModByName("SpellInteractionsVR.esp");
- if (mod) {
- // mod->GetModIndex() isn't universally available; use handler->GetLoadedModIndex
- auto idx = handler->GetLoadedModIndex("SpellInteractionsVR.esp");
- if (idx && *idx !=0xFF) {
- unsigned int modIndex = static_cast<unsigned int>(*idx);
- SKSE::log::info("SpellInteractionsVR.esp is loaded. Mod index:0x{:02X}", modIndex);
- InteractiveWaterVR::AppendToPluginLog("INFO", "SpellInteractionsVR.esp is loaded. Mod index:0x%02X", modIndex);
- } else {
- IW_LOG_WARN("SpellInteractionsVR.esp is loaded but mod index invalid");
- }
+	void CancelScheduledStartMod()
+	{
+		// increment generation to invalidate pending tasks
+		s_startGeneration.fetch_add(1, std::memory_order_acq_rel);
+		// reset mod started flag so future loads can start fresh
+		s_modStarted.store(false);
+		// reset reschedule count
+		s_rescheduleCount.store(0);
+	}
 
- // Iterate all loaded forms and log those that belong to this mod
- auto allFormsPair = RE::TESForm::GetAllForms();
- auto& allFormsMap = *allFormsPair.first;
- auto& lock = allFormsPair.second.get();
- std::size_t found =0;
- {
- // Acquire read lock while iterating
- RE::BSReadLockGuard guard{ lock };
- for (const auto& kv : allFormsMap) {
- const auto form = kv.second;
- if (!form) {
- continue;
- }
- const auto file = form->GetFile();
- if (file == mod) {
- ++found;
- const char* editorID = form->GetFormEditorID();
- const char* name = form->GetName();
+	void LogSpellInteractionsVRLoaded()
+	{
+		// Only run once per game session
+		bool expected = false;
+		if (!s_spellLogged.compare_exchange_strong(expected, true)) {
+			return;
+		}
 
- std::string typeStr;
- auto typeView = RE::FormTypeToString(form->GetFormType());
- if (!typeView.empty()) {
- typeStr = std::string(typeView);
- } else {
- typeStr = "<none>";
- }
+		auto handler = RE::TESDataHandler::GetSingleton();
+		if (!handler) {
+			IW_LOG_WARN("LogSpellInteractionsVRLoaded: TESDataHandler not available");
+			s_spellLogged.store(false); // Allow retry
+			return;
+		}
 
- std::string editorIDStr = (editorID && *editorID) ? std::string(editorID) : std::string("<none>");
- std::string nameStr = (name && *name) ? std::string(name) : std::string("<none>");
+		const auto mod = handler->LookupLoadedModByName("SpellInteractionsVR.esp");
+		if (mod) {
+			auto idx = handler->GetLoadedModIndex("SpellInteractionsVR.esp");
+			if (idx && *idx != 0xFF) {
+				unsigned int modIndex = static_cast<unsigned int>(*idx);
+				SKSE::log::info("SpellInteractionsVR.esp is loaded. Mod index:0x{:02X}", modIndex);
+				InteractiveWaterVR::AppendToPluginLog("INFO", "SpellInteractionsVR.esp is loaded. Mod index:0x%02X", modIndex);
+			} else {
+				IW_LOG_WARN("SpellInteractionsVR.esp is loaded but mod index invalid");
+			}
 
- // Use fmt-style logging for SKSE log
- SKSE::log::info(
- "SpellInteractionsVR record #{}: FormID0x{:08X} Type {} EditorID '{}' Name '{}'",
- found,
- static_cast<unsigned int>(form->GetFormID()),
- typeStr,
- editorIDStr,
- nameStr);
+			auto allFormsPair = RE::TESForm::GetAllForms();
+			auto& allFormsMap = *allFormsPair.first;
+			auto& lock = allFormsPair.second.get();
+			std::size_t found = 0;
+			{
+				RE::BSReadLockGuard guard{ lock };
+				for (const auto& kv : allFormsMap) {
+					const auto form = kv.second;
+					if (!form) {
+						continue;
+					}
+					const auto file = form->GetFile();
+					if (file == mod) {
+						++found;
+						const char* editorID = form->GetFormEditorID();
+						const char* name = form->GetName();
 
- // Append to plugin log (printf-style)
- InteractiveWaterVR::AppendToPluginLog(
- "INFO",
- "SpellInteractionsVR record #%zu: FormID0x%08X Type %s EditorID '%s' Name '%s'",
- found,
- static_cast<unsigned int>(form->GetFormID()),
- typeStr.c_str(),
- editorIDStr.c_str(),
- nameStr.c_str());
- }
- }
- }
+						std::string typeStr;
+						auto typeView = RE::FormTypeToString(form->GetFormType());
+						if (!typeView.empty()) {
+							typeStr = std::string(typeView);
+						} else {
+							typeStr = "<none>";
+						}
 
- SKSE::log::info("SpellInteractionsVR.esp: logged {} records", found);
- InteractiveWaterVR::AppendToPluginLog("INFO", "SpellInteractionsVR.esp: logged %zu records", found);
+						std::string editorIDStr = (editorID && *editorID) ? std::string(editorID) : std::string("<none>");
+						std::string nameStr = (name && *name) ? std::string(name) : std::string("<none>");
 
- } else {
- IW_LOG_WARN("SpellInteractionsVR.esp is NOT loaded");
- }
- }
+						SKSE::log::info(
+							"SpellInteractionsVR record #{}: FormID0x{:08X} Type {} EditorID '{}' Name '{}'",
+							found,
+							static_cast<unsigned int>(form->GetFormID()),
+							typeStr,
+							editorIDStr,
+							nameStr);
 
- void StartMod()
- {
- // Implement module startup here: install hooks, initialize state, use helper functions.
- IW_LOG_INFO("Interactive_WATER_VR: StartMod called");
+						InteractiveWaterVR::AppendToPluginLog(
+							"INFO",
+							"SpellInteractionsVR record #%zu: FormID0x%08X Type %s EditorID '%s' Name '%s'",
+							found,
+							static_cast<unsigned int>(form->GetFormID()),
+							typeStr.c_str(),
+							editorIDStr.c_str(),
+							nameStr.c_str());
+					}
+				}
+			}
 
- // Prevent duplicate starts
- bool expectedModStarted = false;
- if (!s_modStarted.compare_exchange_strong(expectedModStarted, true)) {
- IW_LOG_WARN("StartMod: module already started; ignoring duplicate call");
- return;
- }
- 
- // Initialize SetAngle relocation for VM call
- try {
- SetAngle = REL::Relocation<_SetAngle>{ REL::VariantID(0,0,0x009D18F0) };
- IW_LOG_INFO("SetAngle relocation initialized");
- } catch (...) {
- IW_LOG_WARN("StartMod: failed to initialize SetAngle relocation");
- }
- 
- // Initialize MoveTo relocation for VM call (VR address)
- try {
- MoveTo = REL::Relocation<_MoveTo>{ REL::VariantID(0,0,0x009CF360) };
- IW_LOG_INFO("MoveTo relocation initialized");
- } catch (...) {
- IW_LOG_WARN("StartMod: failed to initialize MoveTo relocation");
- }
- 
- // Initialize Delete relocation for despawning (VR address)
- try {
- Delete = REL::Relocation<_Delete>{ REL::VariantID(0,0,0x009CE380) };
- IW_LOG_INFO("Delete relocation initialized");
- } catch (...) {
- IW_LOG_WARN("StartMod: failed to initialize Delete relocation");
- }
-  
-  // Defensive readiness checks: ensure player and3D root are available before starting runtime monitoring.
- auto player = RE::PlayerCharacter::GetSingleton();
- if (!player) {
- IW_LOG_WARN("StartMod: player singleton not available yet ? rescheduling StartMod");
- ScheduleStartMod(1);
- return;
- }
- auto root = player->Get3D();
- if (!root) {
- IW_LOG_WARN("StartMod: player3D root not available yet ? rescheduling StartMod");
- ScheduleStartMod(1);
- return;
- }
- 
- // Clear game-load flag now that we are ready to resume monitoring
- InteractiveWaterVR::NotifyGameLoadEnd();
- 
- // Start water monitoring only; HIGGS logging should be done during PostPostLoad when interface is obtained
- StartWaterMonitoring();
+			SKSE::log::info("SpellInteractionsVR.esp: logged {} records", found);
+			InteractiveWaterVR::AppendToPluginLog("INFO", "SpellInteractionsVR.esp: logged %zu records", found);
 
- // Schedule logging of SpellInteractionsVR records after a short delay to ensure TES data and editorIDs are available
- std::thread([](){
- std::this_thread::sleep_for(std::chrono::seconds(3));
- auto taskIntf = SKSE::GetTaskInterface();
- if (taskIntf) {
- taskIntf->AddTask([](){ LogSpellInteractionsVRLoaded(); });
- } else {
- LogSpellInteractionsVRLoaded();
- }
- }).detach();
- }
+		} else {
+			IW_LOG_WARN("SpellInteractionsVR.esp is NOT loaded");
+		}
+	}
 
- void ScheduleStartMod(int delaySeconds)
- {
- if (s_startScheduled.exchange(true)) {
- // already scheduled
- return;
- }
- 
- // Simple scheduler: sleep for delaySeconds, then post a single main-thread
- // task that calls StartMod. StartMod itself will reschedule if the engine
- // isn't ready yet. This avoids complicated readiness loops that give up.
- s_startThread = std::thread([delaySeconds]() {
- try {
- std::this_thread::sleep_for(std::chrono::seconds(delaySeconds));
- // If scheduling was cancelled while sleeping, bail
- if (!s_startScheduled.load()) return;
+	// Internal function that does the actual initialization work
+	static bool TryInitialize()
+	{
+		// Check if player and 3D root are available
+		auto player = RE::PlayerCharacter::GetSingleton();
+		if (!player) {
+			return false;
+		}
+		
+		auto root = player->Get3D();
+		if (!root) {
+			return false;
+		}
 
- auto taskIntf = SKSE::GetTaskInterface();
- if (taskIntf) {
- taskIntf->AddTask([]() {
- // final cancellation check
- if (!s_startScheduled.load()) return;
- StartMod();
- // clear scheduled flag - StartMod will guard duplicate starts
- s_startScheduled.store(false);
- });
- } else {
- // No TaskInterface: attempt to call StartMod directly on this thread
- if (!s_startScheduled.load()) return;
- StartMod();
- s_startScheduled.store(false);
- }
- } catch (...) {
- IW_LOG_WARN("ScheduleStartMod: exception in delay thread");
- s_startScheduled.store(false);
- }
- });
- }
+		IW_LOG_INFO("TryInitialize: player and 3D root available, proceeding with initialization");
+
+		// Initialize SetAngle relocation for VM call
+		try {
+			SetAngle = REL::Relocation<_SetAngle>{ REL::VariantID(0, 0, 0x009D18F0) };
+			IW_LOG_INFO("SetAngle relocation initialized");
+		} catch (...) {
+			IW_LOG_WARN("TryInitialize: failed to initialize SetAngle relocation");
+		}
+
+		// Initialize MoveTo relocation for VM call (VR address)
+		try {
+			MoveTo = REL::Relocation<_MoveTo>{ REL::VariantID(0, 0, 0x009CF360) };
+			IW_LOG_INFO("MoveTo relocation initialized");
+		} catch (...) {
+			IW_LOG_WARN("TryInitialize: failed to initialize MoveTo relocation");
+		}
+
+		// Initialize Delete relocation for despawning (VR address)
+		try {
+			Delete = REL::Relocation<_Delete>{ REL::VariantID(0, 0, 0x009CE380) };
+			IW_LOG_INFO("Delete relocation initialized");
+		} catch (...) {
+			IW_LOG_WARN("TryInitialize: failed to initialize Delete relocation");
+		}
+
+		// Clear game-load flag now that we are ready to resume monitoring
+		InteractiveWaterVR::NotifyGameLoadEnd();
+
+		// Start water monitoring
+		StartWaterMonitoring();
+		IW_LOG_INFO("TryInitialize: water monitoring started successfully");
+
+		return true;
+	}
+
+	void StartMod()
+	{
+		IW_LOG_INFO("Interactive_Water_VR: StartMod called");
+
+		// Check if already started
+		if (s_modStarted.load()) {
+			IW_LOG_INFO("StartMod: module already started; ignoring duplicate call");
+			return;
+		}
+
+		// Try to initialize
+		if (TryInitialize()) {
+			// Success! Mark as started
+			s_modStarted.store(true);
+			IW_LOG_INFO("StartMod: initialization successful");
+			
+			// Schedule logging of SpellInteractionsVR records after a short delay
+			std::thread([]() {
+				std::this_thread::sleep_for(std::chrono::seconds(3));
+				auto taskIntf = SKSE::GetTaskInterface();
+				if (taskIntf) {
+					taskIntf->AddTask([]() { LogSpellInteractionsVRLoaded(); });
+				} else {
+					LogSpellInteractionsVRLoaded();
+				}
+			}).detach();
+		} else {
+			// Failed - will be retried by ScheduleStartMod polling loop
+			IW_LOG_WARN("StartMod: player not ready yet, waiting for retry...");
+		}
+	}
+
+	void ScheduleStartMod(int delaySeconds)
+	{
+		// If already started, nothing to do
+		if (s_modStarted.load()) {
+			IW_LOG_INFO("ScheduleStartMod: module already started, skipping");
+			return;
+		}
+
+		IW_LOG_INFO("ScheduleStartMod: starting initialization polling (delay=%d seconds)", delaySeconds);
+
+		// Capture the current generation to detect cancellation
+		uint32_t myGeneration = s_startGeneration.load();
+
+		// Launch a polling thread that will keep trying until success or cancellation
+		std::thread([delaySeconds, myGeneration]() {
+			try {
+				// Initial delay
+				std::this_thread::sleep_for(std::chrono::seconds(delaySeconds));
+				
+				int attempts = 0;
+				
+				// Keep polling until we succeed, get cancelled, or hit max attempts
+				while (attempts < kMaxReschedules) {
+					// Check if cancelled
+					if (s_startGeneration.load() != myGeneration) {
+						IW_LOG_INFO("ScheduleStartMod: cancelled (generation mismatch)");
+						return;
+					}
+					
+					// Check if already started by another path
+					if (s_modStarted.load()) {
+						IW_LOG_INFO("ScheduleStartMod: module already started by another path");
+						return;
+					}
+					
+					attempts++;
+					IW_LOG_INFO("ScheduleStartMod: attempt %d of %d", attempts, kMaxReschedules);
+					
+					// Try to initialize on the main thread
+					auto taskIntf = SKSE::GetTaskInterface();
+					if (taskIntf) {
+						// Use a flag to communicate success back
+						std::atomic<bool> tryResult{false};
+						std::atomic<bool> taskDone{false};
+						
+						taskIntf->AddTask([&tryResult, &taskDone, myGeneration]() {
+							// Check cancellation again on main thread
+							if (s_startGeneration.load() != myGeneration || s_modStarted.load()) {
+								taskDone.store(true);
+								return;
+							}
+							
+							if (TryInitialize()) {
+								s_modStarted.store(true);
+								tryResult.store(true);
+								IW_LOG_INFO("ScheduleStartMod: initialization successful on main thread");
+								
+								// Schedule spell logging
+								std::thread([]() {
+									std::this_thread::sleep_for(std::chrono::seconds(3));
+									auto ti = SKSE::GetTaskInterface();
+									if (ti) {
+										ti->AddTask([]() { LogSpellInteractionsVRLoaded(); });
+									} else {
+										LogSpellInteractionsVRLoaded();
+									}
+								}).detach();
+							}
+							taskDone.store(true);
+						});
+						
+						// Wait for task to complete (with timeout)
+						int waitMs = 0;
+						while (!taskDone.load() && waitMs < 5000) {
+							std::this_thread::sleep_for(std::chrono::milliseconds(50));
+							waitMs += 50;
+						}
+						
+						if (tryResult.load()) {
+							// Success!
+							return;
+						}
+					} else {
+						// No task interface - try directly (risky but better than nothing)
+						if (TryInitialize()) {
+							s_modStarted.store(true);
+							IW_LOG_INFO("ScheduleStartMod: initialization successful (direct)");
+							return;
+						}
+					}
+					
+					// Wait before next attempt
+					std::this_thread::sleep_for(std::chrono::seconds(1));
+				}
+				
+				IW_LOG_ERROR("ScheduleStartMod: exceeded max attempts (%d), giving up", kMaxReschedules);
+				
+			} catch (const std::exception& e) {
+				IW_LOG_ERROR("ScheduleStartMod: exception: %s", e.what());
+			} catch (...) {
+				IW_LOG_ERROR("ScheduleStartMod: unknown exception");
+			}
+		}).detach();
+	}
 } // namespace InteractiveWaterVR
